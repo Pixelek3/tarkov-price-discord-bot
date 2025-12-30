@@ -39,7 +39,7 @@ Discord bot designed for **Escape from Tarkov** players. It allows for quick ite
 To start the bot, type in the terminal:
 
 ```bash
-python bot.py
+python main.py
 ```
 If successful, you will see the message:
 `Logged in as [YourBotName]`
