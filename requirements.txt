@@ -1,0 +1,8 @@
+discord.py
+aiohttp
+numpy
+opencv-python
+paddleocr
+paddlepaddle
+Levenshtein
+python-dotenv

@@ -1,334 +1,321 @@
 # -*- coding:utf-8 -*-
-
-import cv2
-import easyocr
-import numpy as np
-import re
-import requests
-from discord.ext import commands
 import discord
+from discord.ext import commands, tasks
+import numpy as np
+import cv2
+import aiohttp
+import asyncio
+from paddleocr import PaddleOCR
 from Levenshtein import distance
-import datetime
-import time
-from paddleocr import PaddleOCR,draw_ocr
 import json
+import datetime
+import io
+import os
+from dotenv import load_dotenv
 
-items = {}
-# Create a hash map to store the items
-item_map = {}
+# Load environment variables
+load_dotenv()
 
+# CONFIGURATION
+TOKEN = os.getenv("DISCORD_TOKEN")
+if not TOKEN:
+    print("ERROR: Token not found in .env file!")
+    exit()
 
-query =   """
-        {
-        items {
-            name
-            shortName
-            id
-            avg24hPrice
-            changeLast48hPercent
-            basePrice
-            sellFor {
-              price
-              source
-            }
+CHANNEL_ID = 0  # 0 = works everywhere, or set specific ID
+API_URL = 'https://api.tarkov.dev/graphql'
+
+# Initialize PaddleOCR
+ocr = PaddleOCR(use_textline_orientation=False, lang='en')
+
+# GraphQL Query
+QUERY = """
+{
+    items {
+        name
+        shortName
+        id
+        avg24hPrice
+        changeLast48hPercent
+        basePrice
+        sellFor {
+            price
+            source
         }
     }
-    """
+}
+"""
+
+class TarkovBot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.all()
+        super().__init__(command_prefix="!", intents=intents)
+        self.item_map = {}   # Map: name -> item data
+        self.item_names = [] # List of names for searching
+
+    async def setup_hook(self):
+        self.update_prices.start()
+
+    @tasks.loop(minutes=30)
+    async def update_prices(self):
+        """Fetches prices from the API every 30 minutes."""
+        print(f"[{datetime.datetime.now()}] Updating prices...")
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(API_URL, json={'query': QUERY}) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        new_map = {}
+                        new_names = []
+                        
+                        for item in data['data']['items']:
+                            key_name = item['name'].lower()
+                            key_short = item['shortName'].lower()
+                            
+                            new_map[key_name] = item
+                            new_map[key_short] = item
+                            
+                            new_names.append(key_name)
+                            new_names.append(key_short)
+                        
+                        self.item_map = new_map
+                        self.item_names = list(set(new_names))
+                        print(f"Loaded {len(self.item_map)} items.")
+                        
+                        # Emergency backup
+                        with open('data.json', 'w') as fp:
+                            json.dump(self.item_map, fp, indent=4)
+                    else:
+                        print(f"API Error: {response.status}")
+        except Exception as e:
+            print(f"Error occurred during update: {e}")
+
+    @update_prices.before_loop
+    async def before_update_prices(self):
+        await self.wait_until_ready()
+
+bot = TarkovBot()
+
+def get_best_match(text, item_map, threshold=3):
+    """Searches for an item by Name and ShortName."""
+    clean_text = text.lower().strip().replace('.', '') 
+    original_text_lower = text.lower().strip()
     
-with open('data.json', 'r') as fp:
-    if fp:
-        print(fp)
-        item_map = json.load(fp)
+    # Fast lookup (O(1))
+    if clean_text in item_map:
+        return item_map[clean_text]
+    if original_text_lower in item_map:
+        return item_map[original_text_lower]
+    
+    if len(clean_text) < 2: return None
+
+    # Fallback: Check ShortName manually
+    for item in item_map.values():
+        item_short = item['shortName'].lower().replace('.', '')
+        if item_short == clean_text:
+            return item
+
+    # Fuzzy Search (Levenshtein)
+    best_item = None
+    best_dist = 100
+    
+    for key in item_map.keys():
+        if abs(len(key) - len(clean_text)) > threshold:
+            continue
             
+        dist = distance(clean_text, key)
+        
+        if dist == 0: 
+            return item_map[key]
+            
+        if dist < best_dist:
+            best_dist = dist
+            best_item = item_map[key]
+    
+    if best_dist <= threshold:
+        return best_item
+        
+    return None
+
+def get_flea_price(item_data):
+    """Extracts the Flea Market price."""
+    prices = item_data.get("sellFor", [])
+    for p in prices:
+        if p["source"] == "fleaMarket":
+            return p["price"]
+    # If not on Flea, return highest trader price
+    if prices:
+        return max(p["price"] for p in prices)
+    return 0
+
+def extract_text_smart(data):
+    """Helper function to extract text from nested structures."""
+    found = []
+    
+    if isinstance(data, dict):
+        for key, value in data.items():
+            found.extend(extract_text_smart(value))
+            
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                if isinstance(item[1], (list, tuple)) and len(item[1]) >= 1:
+                    found.append(item[1][0])
+                elif isinstance(item[1], str):
+                    found.append(item[1])
+            else:
+                found.extend(extract_text_smart(item))
                 
-response = requests.post('https://api.tarkov.dev/graphql', json={'query': query })
-if response.status_code == 200:
-    data = response.json()
-    print(len(item_map))
-    has_map = len(item_map) > 0
-    print(has_map)
-    for item in data["data"]["items"]:
-        if not has_map:
-            # Add the item to the hash map using the lowercase short name as the key
-            item_map[item["shortName"].lower()] = item["id"]
-        items[item["id"]] = item
-    if not has_map:
-        with open('data.json', 'w') as fp:
-            json.dump(item_map, fp, sort_keys=True, indent=4)
+    elif isinstance(data, str):
+        if len(data) > 2:
+            pass 
 
-else:
-    raise Exception("Query failed to run by returning code of {}. {}".format(response.status_code, query))
+    return found
 
-
-import threading
-
-def update(): 
-    response = requests.post('https://api.tarkov.dev/graphql', json={'query': query })
-    if response.status_code == 200:
-        data = response.json()
-        for item in data["data"]["items"]:
-            items[item["id"]] = item
-        print("ITEMS UPDATED")
-        with open('data.json', 'w') as fp:
-            json.dump(item_map, fp, sort_keys=True, indent=4)
-    else:
-        print("ITEMS UPDATED FAILED")
-    t = threading.Timer(1800, update ,args=[])
-    t.start()
-
-
-t = threading.Timer(1800, update ,args=[])
-t.start()
-
-
-
-def findItemMatch(name):
-    output = None
+def process_image_ocr(image_bytes):
+    image = np.asarray(bytearray(image_bytes), dtype="uint8")
+    img = cv2.imdecode(image, cv2.IMREAD_COLOR)
     
-    # Try to find an exact match in the hash map
-    output = item_map.get(name.lower())
+    if img is None:
+        return []
 
-    if not output:
-        for item_name in item_map.keys():
-            if distance(name.lower(), item_name) == 1:
-                output = item_map[item_name]
-                item_map[name.lower()] = output
-                break   
-    if not output:
-        for item_name in item_map.keys():
-            if distance(name.lower(), item_name) == 2 and len(name) > 4:
-                output = item_map[item_name]
-                item_map[name.lower()] = output
-                break
-    return output
+    # Upscaling 2x
+    try:
+        img = cv2.resize(img, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    except Exception:
+        pass
 
-def findItem(name):
+    try:
+        result = ocr.ocr(img)
+    except Exception as e:
+        print(f"OCR engine error: {e}")
+        return []
 
-    # Try to find an exact match in the hash map
-    output = item_map.get(name.lower())
+    detected_texts = []
 
-    if not output:
-        for item_name in item_map.keys():
-            if distance(name.lower(), item_name) == 1:
-                output = item_map[item_name]
-                item_map[name.lower()] = output
-                break
-    if not output:
-        for item_name in item_map.keys():
-            if distance(name.lower(), item_name) == 2 and len(name) > 4:
-                output = item_map[item_name]
-                item_map[name.lower()] = output
-                break
+    try:
+        if isinstance(result, list) and len(result) > 0:
+            data = result[0]
+            
+            if isinstance(data, dict) and 'rec_texts' in data:
+                texts = data['rec_texts']
+                scores = data.get('rec_scores', [])
+                
+                for i, text in enumerate(texts):
+                    score = scores[i] if i < len(scores) else 0.0
+                    
+                    if score > 0.5 and len(text) > 2:
+                        detected_texts.append(text)
+            
+            # Fallback method
+            else:
+                print("Missing 'rec_texts' key, attempting fallback method...")
+                detected_texts = extract_text_recursive_fallback(result)
 
-    return output
+    except Exception as e:
+        print(f"Error extracting text: {e}")
+        return []
 
-def GetPrice(prices):
-  for x in prices:
-    if x["source"] == "fleaMarket":
-      return x["price"]
-  return 0
+    return list(set(detected_texts))
 
-
-
-ocr = PaddleOCR(lang='en', det_limit_side_len=1280) 
-
-reader = easyocr.Reader(['en']) # this needs to run only once to load the model into memory
-
-channel_id = 0 #YOUR CHANNEL ID
-
-def apply_brightness_contrast(input_img, brightness = 0, contrast = 0):
-    
-    if brightness != 0:
-        if brightness > 0:
-            shadow = brightness
-            highlight = 255
-        else:
-            shadow = 0
-            highlight = 255 + brightness
-        alpha_b = (highlight - shadow)/255
-        gamma_b = shadow
-        
-        buf = cv2.addWeighted(input_img, alpha_b, input_img, 0, gamma_b)
-    else:
-        buf = input_img.copy()
-    
-    if contrast != 0:
-        f = 131*(contrast + 127)/(127*(131-contrast))
-        alpha_c = f
-        gamma_c = 127*(1-f)
-        
-        buf = cv2.addWeighted(buf, alpha_c, buf, 0, gamma_c)
-
-    return buf
-
-
-bot = commands.Bot(command_prefix="!", intents=discord.Intents.all())
+def extract_text_recursive_fallback(data):
+    found = []
+    if isinstance(data, list):
+        for item in data:
+            found.extend(extract_text_recursive_fallback(item))
+    elif isinstance(data, dict):
+        for val in data.values():
+            found.extend(extract_text_recursive_fallback(val))
+    elif isinstance(data, str) and len(data) > 2:
+        found.append(data)
+    return found
 
 @bot.event
 async def on_ready():
-    print("Bot gotowy do dzialania")
-    activity = discord.Game(name="Checking...", type=3)
-    await bot.change_presence(status=discord.Status.idle, activity=activity)
+    print(f'Logged in as {bot.user}')
+    await bot.change_presence(activity=discord.Game(name="Checking Flea prices"))
 
 @bot.command()
 async def c(ctx):
-  if ctx.channel.id == channel_id or ctx.channel.id == channel_id2:
-    if ctx.message.attachments:
-        st = datetime.datetime.now()
-        timemsg = await ctx.send("Calculate...")
-        resp = requests.get(ctx.message.attachments[0].url, stream=True).raw
-        image = np.asarray(bytearray(resp.read()), dtype="uint8")
-        originalImage = cv2.imdecode(image, cv2.IMREAD_COLOR)
-        originalImage = cv2.resize(originalImage, None,fx=2 ,fy=2,interpolation=cv2.INTER_LANCZOS4  )
+    """Command to check prices from an image."""
+    if CHANNEL_ID != 0 and ctx.channel.id != CHANNEL_ID:
+        return
 
-        grayImage = cv2.cvtColor(originalImage, cv2.COLOR_BGR2GRAY)
+    if not ctx.message.attachments:
+        await ctx.send("Please attach an inventory image!")
+        return
 
-        kernel = np.ones((1,1), np.uint8)
-        img = cv2.dilate(grayImage, kernel, iterations=1)
-        img = cv2.erode(img, kernel, iterations=1)
+    status_msg = await ctx.send("🔍 Analyzing image...")
+    start_time = datetime.datetime.now()
 
+    try:
+        attachment = ctx.message.attachments[0]
+        async with aiohttp.ClientSession() as session:
+            async with session.get(attachment.url) as resp:
+                if resp.status != 200:
+                    await status_msg.edit(content="❌ Error downloading image.")
+                    return
+                image_bytes = await resp.read()
 
+        loop = asyncio.get_running_loop()
+        detected_texts = await loop.run_in_executor(None, process_image_ocr, image_bytes)
 
-      #  img = cv2.threshold(cv2.medianBlur(img, 1), 10, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        if not detected_texts:
+            await status_msg.edit(content="❌ No text detected on the image.")
+            return
 
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-        img = cv2.morphologyEx(img, cv2.MORPH_OPEN, kernel)
+        found_items = []
+        processed_names = set()
 
+        for text in detected_texts:
+            if len(text) < 3 or text.isdigit(): continue
+            
+            match = get_best_match(text, bot.item_map)
+            
+            if match and match['id'] not in processed_names:
+                processed_names.add(match['id'])
+                found_items.append(match)
 
-        #img = cv2.threshold(cv2.medianBlur(img, 3), 110, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-
-        # img = cv2.bitwise_not(img)
-
-
-        img = apply_brightness_contrast(img, 0, 30)
-
-        normal_res = reader.readtext(img, detail = 1 , blocklist ="[]{}|;@:~", link_threshold  = 1.0)
-
-        test = []
-        for x in normal_res:
-            if x[2] > 0.15:
-                test.append(x[1])
-
-        mainresult = test
-        mainresult = sorted(set(mainresult), key=lambda x:mainresult.index(x))
-
-
-       
-        embed = discord.Embed(
-            title = "Tarkov Price Checker",
-            description= "Allows you to almost quickly check the value of your inventory",
-            colour= discord.Colour.blue()
-        )
-
-        for name in mainresult:
-            names = name.split()
-            if len(names) > 1:
-                if not findItemMatch(name):
-                    for new in names:
-                        mainresult.append(new)
-
-        for name in mainresult:
-          name = name.replace("/", "").replace("_", " ")
-          if not name.isdigit():
-            if len(name) >= 2:
-                info = findItem(name)
-                print(name)
-                if info:
-                  result = items[info]
-                  if result["changeLast48hPercent"] >= 0:
-                    tempvalue = "```ansi\n %s₽ \u001b[0;32m(%s)\n```" % (GetPrice(result["sellFor"]), str(result["changeLast48hPercent"]) + "%")
-                  else:
-                    tempvalue = "```ansi\n %s₽ \u001b[0;31m(%s)\n```" % (GetPrice(result["sellFor"]), str(result["changeLast48hPercent"]) + "%")
-                  embed.add_field(name=result["name"], value=tempvalue)
-        await timemsg.delete()
-        et = datetime.datetime.now()
-        elapsed_time = et - st
-        embed.set_footer(text="API: tarkov.dev \nOperation time: %s" % str(round(elapsed_time.total_seconds(), 2)) + " s")
-        await ctx.send(embed=embed)
-    else:   
-        await ctx.send("You need to add photo")
-
-
-@bot.command()
-async def c2(ctx):
-  if ctx.channel.id == channel_id:
-    if ctx.message.attachments:
-        st = datetime.datetime.now()
-        timemsg = await ctx.send("Calculate...")
-        resp = requests.get(ctx.message.attachments[0].url, stream=True).raw
-        image = np.asarray(bytearray(resp.read()), dtype="uint8")
-        originalImage = cv2.imdecode(image, cv2.IMREAD_COLOR)
-        originalImage = cv2.resize(originalImage, None,fx=2 ,fy=2,interpolation=cv2.INTER_LANCZOS4  )
-
-        # grayImage = cv2.cvtColor(originalImage, cv2.COLOR_BGR2GRAY)
-
-        kernel = np.ones((1,1), np.uint8)
-        img = cv2.dilate(originalImage, kernel, iterations=1)
-        img = cv2.erode(img, kernel, iterations=1)
-
-
-
-      #  img = cv2.threshold(cv2.medianBlur(img, 1), 10, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-
-       
-
-        #img = cv2.threshold(cv2.medianBlur(img, 3), 110, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-
-        # img = cv2.bitwise_not(img)
-
-
-        img = apply_brightness_contrast(img, 35, 80)
-
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-        img = cv2.morphologyEx(img, cv2.MORPH_OPEN, kernel)
-
-        test = []
-        result = ocr.ocr(img, cls=False)
-        for idx in range(len(result)):
-            res = result[idx]
-            for line in res:
-                if line[1][1] > 0.7:
-                    test.append(line[1][0])
-
-    
-        mainresult = test
-        mainresult = sorted(set(mainresult), key=lambda x:mainresult.index(x))
-
+        if not found_items:
+            await status_msg.edit(content=f"Read text: *{', '.join(detected_texts[:5])}...*\nBut no items matched.")
+            return
 
         embed = discord.Embed(
-            title = "Tarkov Price Checker",
-            description= "Allows you to almost quickly check the value of your inventory",
-            colour= discord.Colour.blue()
+            title="Tarkov Price Check",
+            color=discord.Color.dark_green(),
+            timestamp=datetime.datetime.now()
         )
 
-        for name in mainresult:
-            names = name.split()
-            if len(names) > 1:
-                if not findItemMatch(name):
-                    for new in names:
-                        mainresult.append(new)
-        test_list = []
-        for name in mainresult:
-          name = name.replace("/", "").replace("_", " ")
-          if not name.isdigit():
-           if len(name) >= 2:
-                info = findItem(name)
-                print(name)
-                if info and not info in test_list:
-                  test_list.append(info)
-                  result = items[info]
-                  if result["changeLast48hPercent"] >= 0:
-                    tempvalue = "```ansi\n %s₽ \u001b[0;32m(%s)\n```" % (GetPrice(result["sellFor"]), str(result["changeLast48hPercent"]) + "%")
-                  else:
-                    tempvalue = "```ansi\n %s₽ \u001b[0;31m(%s)\n```" % (GetPrice(result["sellFor"]), str(result["changeLast48hPercent"]) + "%")
-                  embed.add_field(name=result["name"], value=tempvalue)
-        await timemsg.delete()
-        del test_list
-        et = datetime.datetime.now()
-        elapsed_time = et - st
-        embed.set_footer(text="API: tarkov.dev \Operation Time: %s" % str(round(elapsed_time.total_seconds(), 2)) + " s")
-        await ctx.send(embed=embed)
-    else:   
-        await ctx.send("You need to add photo")        
+        for item in found_items[:24]:
+            price = get_flea_price(item)
+            avg_price = item.get("avg24hPrice", 0) or 0
+            
+            change = item.get("changeLast48hPercent")
+            
+            if change is None and avg_price > 0 and price > 0:
+                try:
+                    change = ((price - avg_price) / avg_price) * 100
+                except ZeroDivisionError:
+                    change = 0
+            
+            if change is None:
+                change = 0
+
+            color_code = "32" if change >= 0 else "31" # Green / Red
+            sign = "+" if change > 0 else ""
+            
+            val_str = f"```ansi\n{price:,} ₽ \u001b[0;{color_code}m({sign}{change:.1f}%)\u001b[0m\n```"
+            
+            embed.add_field(name=item['name'], value=val_str, inline=True)
+
+        elapsed = (datetime.datetime.now() - start_time).total_seconds()
+        embed.set_footer(text=f"Processed in {elapsed:.2f}s | API: tarkov.dev")
         
-bot.run("") #Bot Token
+        await status_msg.delete()
+        await ctx.send(embed=embed)
+
+    except Exception as e:
+        print(f"Error in !c command: {e}")
+        await status_msg.edit(content="❌ Critical error during processing.")
+
+bot.run(TOKEN)
